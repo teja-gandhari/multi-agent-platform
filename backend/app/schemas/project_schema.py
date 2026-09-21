@@ -2,6 +2,8 @@ from pydantic import BaseModel
 from uuid import UUID
 from datetime import datetime
 
+from app.models.enums import ProjectStatus
+
 
 class ProjectCreate(BaseModel):
     title:str
@@ -12,6 +14,7 @@ class ProjectReponse(BaseModel):
     name:str
     description:str | None
     owner_id:UUID
+    status:ProjectStatus
     created_at:datetime
     updated_at:datetime
 
@@ -20,8 +23,15 @@ class ProjectReponse(BaseModel):
     }
 
 class ProjectListResponse(BaseModel):
-    item:list[ProjectReponse]
+    items:list[ProjectReponse]
     page:int
     limit:int
     total:int
     total_pages:int
+
+class ProjectUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+
+class ProjectStatusUpdate(BaseModel):
+    status:ProjectStatus
