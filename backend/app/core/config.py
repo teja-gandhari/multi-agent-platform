@@ -12,7 +12,6 @@ class Settings(BaseSettings):
 
     REDIS_URL:str
 
-    OPENAI_API_KEY:str
 
 
     model_config = SettingsConfigDict(
