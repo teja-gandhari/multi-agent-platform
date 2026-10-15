@@ -44,10 +44,21 @@ def get_user_request(state: dict) -> str:
     return request.strip()
 
 
-def build_planning_prompt(user_request: str) -> str:
+def build_planning_prompt(user_request: str, previous_plan: str = "", feedback: str = "") -> str:
+    revision_context = ""
+    if feedback.strip():
+        revision_context = (
+            "\n\nPLAN REVISION REQUEST\n"
+            "The user reviewed the previous plan and requested these changes:\n"
+            f"{feedback.strip()}\n\n"
+            "Previous plan (revise it rather than ignoring it):\n"
+            f"{previous_plan.strip()}\n\n"
+            "Produce a complete revised plan incorporating the requested changes.\n"
+        )
     return (
         "Create a frontend-only implementation plan for this application request. No generated backend, API, or database.\n\n"
         f"USER REQUEST:\n{user_request}\n\n"
+        f"{revision_context}"
         "Structure your response using these sections:\n"
         "1. Application objective\n"
         "2. Core features and screens\n"
@@ -63,10 +74,11 @@ def build_planning_prompt(user_request: str) -> str:
     )
 
 
-def create_plan(user_request: str) -> str:
+def create_plan(user_request: str, previous_plan: str = "", feedback: str = "") -> str:
     """Raises LLMError (typed, already retried per policy) on failure."""
     return llm.chat_text(
-        "planner", SYSTEM_PROMPT, build_planning_prompt(user_request)
+        "planner", SYSTEM_PROMPT,
+        build_planning_prompt(user_request, previous_plan, feedback)
     )
 
 def planner_agent(state: dict) -> dict:
@@ -84,7 +96,11 @@ def planner_agent(state: dict) -> dict:
     """
     try:
         user_request = get_user_request(state)
-        plan = create_plan(user_request)
+        plan = create_plan(
+            user_request,
+            previous_plan=str(state.get("plan", "") or ""),
+            feedback=str(state.get("planner_feedback", "") or ""),
+        )
 
         print("[Planner] Implementation plan created.")
 

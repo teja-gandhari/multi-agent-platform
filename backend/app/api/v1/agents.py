@@ -1,4 +1,3 @@
-
 from datetime import datetime
 from uuid import UUID
 
@@ -11,7 +10,10 @@ from app.database.session import get_db
 from app.models.agent_message import AgentMessage
 from app.models.agent_run import AgentRun
 from app.models.user import User
-from app.services.nexus_workflow_adapter import run_nexus_workflow
+from app.services.nexus_workflow_adapter import (
+    resume_nexus_workflow,
+    run_nexus_workflow,
+)
 from app.services.project_service import ProjectService
 
 router = APIRouter(prefix="/agents", tags=["Agents"])
@@ -25,6 +27,10 @@ class AgentRequest(BaseModel):
 class AgentResponse(BaseModel):
     project_id: str
     workflow_status: str
+    run_id: str = ""
+    planner_md: str = ""
+    approval_status: str = "not_started"
+    plan_approved: bool = False
     application_url: str = ""
     revision_count: int = 0
     plan: str = ""
@@ -61,6 +67,42 @@ class AgentMessageResponse(BaseModel):
     created_at: datetime
 
 
+class AgentPlanResponse(BaseModel):
+    run_id: UUID
+    project_id: UUID
+    requested_task: str
+    workflow_status: str
+    approval_status: str
+    plan_approved: bool
+    planner_md: str
+
+
+class PlanFeedbackRequest(BaseModel):
+    feedback: str = Field(min_length=1, max_length=2000)
+
+
+def _get_owned_run(db: Session, run_id: UUID, current_user: User) -> AgentRun:
+    run = db.query(AgentRun).filter(AgentRun.id == run_id).first()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Agent run not found.")
+    ProjectService(db).get_project(run.project_id, current_user)
+    return run
+
+
+def _run_result(run: AgentRun) -> dict:
+    return run.result if isinstance(run.result, dict) else {}
+
+
+def _save_workflow_result(db: Session, run: AgentRun, result: dict) -> AgentResponse:
+    response = AgentResponse(**result)
+    run.status = response.workflow_status.lower()
+    run.result = response.model_dump(mode="json")
+    run.error_message = response.error_message or None
+    db.commit()
+    db.refresh(run)
+    return response
+
+
 @router.post("/run", response_model=AgentResponse)
 async def run_agent(
     request: AgentRequest,
@@ -70,13 +112,9 @@ async def run_agent(
     try:
         project_id = UUID(request.project_id)
     except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid project ID format.",
-        ) from exc
+        raise HTTPException(status_code=400, detail="Invalid project ID format.") from exc
 
     ProjectService(db).get_project(project_id, current_user)
-
     run = AgentRun(
         project_id=project_id,
         requested_task=request.task,
@@ -89,10 +127,7 @@ async def run_agent(
         db.refresh(run)
     except Exception as exc:
         db.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail="Could not create workflow run.",
-        ) from exc
+        raise HTTPException(status_code=500, detail="Could not create workflow run.") from exc
 
     try:
         result = await run_nexus_workflow(
@@ -100,19 +135,9 @@ async def run_agent(
             user_request=request.task,
             run_id=str(run.id),
         )
-
-        response = AgentResponse(**result)
-
-        run.status = response.workflow_status.lower()
-        run.result = response.model_dump(mode="json")
-        run.error_message = response.error_message or None
-
-        db.commit()
-        return response
-
+        return _save_workflow_result(db, run, result)
     except Exception as exc:
         db.rollback()
-
         try:
             failed_run = db.get(AgentRun, run.id)
             if failed_run:
@@ -121,24 +146,16 @@ async def run_agent(
                 db.commit()
         except Exception:
             db.rollback()
-
-        raise HTTPException(
-            status_code=500,
-            detail="Agent workflow execution failed.",
-        ) from exc
+        raise HTTPException(status_code=500, detail="Agent workflow execution failed.") from exc
 
 
-@router.get(
-    "/runs/{project_id}",
-    response_model=list[AgentRunHistoryItem],
-)
+@router.get("/runs/{project_id}", response_model=list[AgentRunHistoryItem])
 def get_agent_run_history(
     project_id: UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     ProjectService(db).get_project(project_id, current_user)
-
     return (
         db.query(AgentRun)
         .filter(AgentRun.project_id == project_id)
@@ -148,35 +165,87 @@ def get_agent_run_history(
     )
 
 
-@router.get(
-    "/runs/{run_id}/messages",
-    response_model=list[AgentMessageResponse],
-)
+@router.get("/runs/{run_id}/plan", response_model=AgentPlanResponse)
+def get_agent_run_plan(
+    run_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    run = _get_owned_run(db, run_id, current_user)
+    result = _run_result(run)
+    return AgentPlanResponse(
+        run_id=run.id,
+        project_id=run.project_id,
+        requested_task=run.requested_task,
+        workflow_status=run.status.upper(),
+        approval_status=result.get("approval_status", "not_started"),
+        plan_approved=bool(result.get("plan_approved", False)),
+        planner_md=result.get("planner_md") or result.get("plan", ""),
+    )
+
+
+@router.post("/runs/{run_id}/approve", response_model=AgentResponse)
+async def approve_agent_plan(
+    run_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    run = _get_owned_run(db, run_id, current_user)
+    if run.status != "waiting_for_approval":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Run is not waiting for plan approval (status={run.status}).",
+        )
+
+    try:
+        result = await resume_nexus_workflow(
+            project_id=str(run.project_id),
+            run_id=str(run.id),
+            approved=True,
+        )
+        return _save_workflow_result(db, run, result)
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not resume approved workflow.") from exc
+
+
+@router.post("/runs/{run_id}/request-changes", response_model=AgentResponse)
+async def request_agent_plan_changes(
+    run_id: UUID,
+    request: PlanFeedbackRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    run = _get_owned_run(db, run_id, current_user)
+    if run.status != "waiting_for_approval":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Run is not waiting for plan approval (status={run.status}).",
+        )
+
+    try:
+        result = await resume_nexus_workflow(
+            project_id=str(run.project_id),
+            run_id=str(run.id),
+            approved=False,
+            feedback=request.feedback,
+        )
+        return _save_workflow_result(db, run, result)
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not revise workflow plan.") from exc
+
+
+@router.get("/runs/{run_id}/messages", response_model=list[AgentMessageResponse])
 def get_agent_run_messages(
     run_id: UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # Find the requested run.
-    run = (
-        db.query(AgentRun)
-        .filter(AgentRun.id == run_id)
-        .first()
-    )
-
-    if run is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Agent run not found.",
-        )
-
-    # Check ownership before exposing any run messages.
-    ProjectService(db).get_project(run.project_id, current_user)
-
-    # Return up to 500 messages in chronological order.
+    run = _get_owned_run(db, run_id, current_user)
     return (
         db.query(AgentMessage)
-        .filter(AgentMessage.run_id == run_id)
+        .filter(AgentMessage.run_id == run.id)
         .order_by(AgentMessage.created_at.asc())
         .limit(500)
         .all()

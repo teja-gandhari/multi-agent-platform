@@ -11,6 +11,8 @@ import uuid
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command, interrupt
 
 from agents.coder import coder_agent
 from agents.developer import developer_agent
@@ -95,8 +97,13 @@ class WorkflowState(TypedDict, total=False):
     project_id: str
     user_request: str
     project_context: str
+    run_id: str
 
     plan: Any
+    planner_md: str
+    planner_feedback: str
+    approval_status: str
+    plan_approved: bool
     planner_status: str
     planner_error: str
 
@@ -211,6 +218,7 @@ def planner_node(state: WorkflowState) -> dict:
         if status == "COMPLETED" and plan:
             return {
                 "plan": plan,
+                "planner_md": plan,
                 "planner_status": "COMPLETED",
                 "planner_error": "",
                 "error_message": "",
@@ -232,10 +240,87 @@ def planner_node(state: WorkflowState) -> dict:
 
 def planner_router(state: WorkflowState) -> str:
     return (
-        "researcher"
+        "approval_gate"
         if state.get("planner_status") == "COMPLETED"
         else "finish"
     )
+
+
+def approval_gate_node(state: WorkflowState) -> dict:
+    """Pause the graph until a human approves or requests plan changes.
+
+    Do not wrap this node in try/except: LangGraph's interrupt mechanism
+    raises an internal control-flow exception to pause execution.
+    """
+    project_id = str(state.get("project_id", ""))
+    plan = str(state.get("planner_md") or state.get("plan") or "")
+    run_id = str(state.get("run_id", ""))
+
+    _emit_progress(
+        project_id,
+        "planner",
+        "waiting_for_approval",
+        "Planner generated a plan. Waiting for user approval.",
+        run_id=run_id,
+        planner_md=plan,
+    )
+
+    decision = interrupt({
+        "type": "plan_approval_required",
+        "run_id": run_id,
+        "project_id": project_id,
+        "planner_md": plan,
+        "message": "Review the plan and approve it or request changes.",
+    })
+
+    if not isinstance(decision, dict):
+        decision = {"approved": bool(decision)}
+
+    if decision.get("approved") is True:
+        _emit_progress(
+            project_id, "planner", "approved",
+            "User approved the implementation plan.", run_id=run_id,
+        )
+        return {
+            "plan_approved": True,
+            "approval_status": "approved",
+            "planner_feedback": "",
+            "error_message": "",
+        }
+
+    feedback = str(decision.get("feedback", "")).strip()
+    if feedback:
+        _emit_progress(
+            project_id, "planner", "revision_requested",
+            "User requested changes to the implementation plan.",
+            run_id=run_id,
+            feedback=feedback,
+        )
+        return {
+            "plan_approved": False,
+            "approval_status": "revision_requested",
+            "planner_feedback": feedback,
+            "error_message": "",
+        }
+
+    _emit_progress(
+        project_id, "planner", "rejected",
+        "User rejected the implementation plan.", run_id=run_id,
+    )
+    return {
+        "plan_approved": False,
+        "approval_status": "rejected",
+        "planner_feedback": "",
+        "error_message": "Plan rejected by user.",
+    }
+
+
+def approval_gate_router(state: WorkflowState) -> str:
+    if state.get("plan_approved") is True:
+        return "researcher"
+    if state.get("approval_status") == "revision_requested":
+        return "planner"
+    return "finish"
 
 
 def researcher_node(state: WorkflowState) -> dict:
@@ -600,10 +685,15 @@ def finish_node(state: WorkflowState) -> dict:
         and bool(state.get("application_url"))
     )
 
-    workflow_status = "COMPLETED" if successful else "FAILED"
+    if state.get("approval_status") == "rejected":
+        workflow_status = "REJECTED"
+    else:
+        workflow_status = "COMPLETED" if successful else "FAILED"
 
     error_message = ""
-    if not successful:
+    if workflow_status == "REJECTED":
+        error_message = "Plan rejected by user."
+    elif not successful:
         error_message = (
             state.get("error_message", "")
             or state.get("failure_details", "")
@@ -648,6 +738,7 @@ def finish_node(state: WorkflowState) -> dict:
 builder = StateGraph(WorkflowState)
 
 builder.add_node("planner", _progress_node("planner", planner_node))
+builder.add_node("approval_gate", approval_gate_node)
 builder.add_node("researcher", _progress_node("researcher", researcher_node))
 builder.add_node("developer", _progress_node("developer", developer_node))
 builder.add_node("coder", _progress_node("coder", coder_node))
@@ -662,7 +753,17 @@ builder.add_conditional_edges(
     "planner",
     planner_router,
     {
+        "approval_gate": "approval_gate",
+        "finish": "finish",
+    },
+)
+
+builder.add_conditional_edges(
+    "approval_gate",
+    approval_gate_router,
+    {
         "researcher": "researcher",
+        "planner": "planner",
         "finish": "finish",
     },
 )
@@ -723,7 +824,7 @@ builder.add_conditional_edges(
 
 builder.add_edge("finish", END)
 
-app = builder.compile()
+app = builder.compile(checkpointer=InMemorySaver())
 
 
 def make_project_id(user_request: str) -> str:
@@ -732,7 +833,7 @@ def make_project_id(user_request: str) -> str:
     return f"{slug}_{uuid.uuid4().hex[:8]}"
 
 
-def build_initial_state(user_request: str, project_id: str | None = None) -> WorkflowState:
+def build_initial_state(user_request: str, project_id: str | None = None, run_id: str | None = None) -> WorkflowState:
     """Build workflow state, preserving a project ID supplied by the host backend."""
     if not isinstance(user_request, str) or not user_request.strip():
         raise ValueError("user_request must be a non-empty string.")
@@ -741,9 +842,14 @@ def build_initial_state(user_request: str, project_id: str | None = None) -> Wor
         raise ValueError("project_id must be a non-empty path-safe identifier.")
     return {
         "project_id": resolved_project_id,
+        "run_id": str(run_id or uuid.uuid4()),
         "user_request": user_request,
         "project_context": PROJECT_CONTEXT,
         "plan": "",
+        "planner_md": "",
+        "planner_feedback": "",
+        "approval_status": "not_started",
+        "plan_approved": False,
         "planner_status": "PENDING",
         "research": "",
         "research_output": "",
@@ -767,15 +873,28 @@ def build_initial_state(user_request: str, project_id: str | None = None) -> Wor
     }
 
 
-def _public_result(state: dict[str, Any], project_id: str) -> dict[str, Any]:
-    """Return a stable integration result without removing the original state fields."""
+def _public_result(
+    state: dict[str, Any],
+    project_id: str,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Return JSON-friendly workflow fields to the host backend."""
+    public_state = {
+        key: value for key, value in state.items()
+        if not key.startswith("__")
+    }
+    resolved_run_id = str(run_id or state.get("run_id", ""))
     return {
-        **state,
+        **public_state,
         "project_id": project_id,
+        "run_id": resolved_run_id,
         "workflow_status": state.get("workflow_status", "FAILED"),
         "application_url": state.get("application_url", ""),
         "revision_count": int(state.get("revision_count", 0) or 0),
         "plan": state.get("plan", ""),
+        "planner_md": state.get("planner_md") or state.get("plan", ""),
+        "approval_status": state.get("approval_status", "not_started"),
+        "plan_approved": bool(state.get("plan_approved", False)),
         "research_output": state.get("research_output", ""),
         "developer_output": state.get("developer_output", ""),
         "test_result": state.get("test_result", {}),
@@ -785,39 +904,150 @@ def _public_result(state: dict[str, Any], project_id: str) -> dict[str, Any]:
     }
 
 
-def run_workflow(project_id: str, user_request: str, on_progress=None) -> dict[str, Any]:
-    """Synchronously run the existing graph for a host-owned project ID.
+def _result_after_invoke(final_state: dict[str, Any], project_id: str, run_id: str) -> dict[str, Any]:
+    """Mark an interrupted graph as waiting for plan approval."""
+    interrupted = bool(final_state.get("__interrupt__"))
+    state = dict(final_state)
+    if interrupted:
+        state["workflow_status"] = "WAITING_FOR_APPROVAL"
+        state["approval_status"] = "pending"
+        state["planner_md"] = state.get("planner_md") or state.get("plan", "")
+    return _public_result(state, project_id, run_id)
 
-    `on_progress` is an optional callable receiving JSON-serializable event dicts.
-    This function is synchronous; async FastAPI handlers should call
-    `await run_workflow_async(...)` or use a background task.
-    """
-    state = build_initial_state(user_request=user_request, project_id=project_id)
+
+def run_workflow(
+    project_id: str,
+    user_request: str,
+    on_progress=None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Run until completion or the plan-approval interrupt."""
+    resolved_run_id = str(run_id or uuid.uuid4())
+    state = build_initial_state(
+        user_request=user_request,
+        project_id=project_id,
+        run_id=resolved_run_id,
+    )
+    config = {
+        "recursion_limit": 60,
+        "configurable": {"thread_id": resolved_run_id},
+    }
     token = _progress_callback.set(on_progress)
-    _emit_progress(project_id, "workflow", "in_progress", "Workflow started")
+    _emit_progress(project_id, "workflow", "in_progress", "Workflow started", run_id=resolved_run_id)
     try:
-        final_state = app.invoke(state, config={"recursion_limit": 60})
-        result = _public_result(final_state, project_id)
-        _emit_progress(project_id, "workflow", "completed" if result["workflow_status"] == "COMPLETED" else "failed", f"Workflow {result['workflow_status'].lower()}", result_status=result["workflow_status"], application_url=result.get("application_url", ""), error_message=result.get("error_message", ""))
+        final_state = app.invoke(state, config=config)
+        result = _result_after_invoke(final_state, project_id, resolved_run_id)
+        status = result["workflow_status"]
+        if status == "WAITING_FOR_APPROVAL":
+            _emit_progress(
+                project_id, "workflow", "waiting_for_approval",
+                "Workflow paused until the plan is approved.",
+                run_id=resolved_run_id,
+                planner_md=result.get("planner_md", ""),
+            )
+        else:
+            _emit_progress(
+                project_id, "workflow",
+                "completed" if status == "COMPLETED" else "failed",
+                f"Workflow {status.lower()}",
+                run_id=resolved_run_id,
+                result_status=status,
+                application_url=result.get("application_url", ""),
+                error_message=result.get("error_message", ""),
+            )
         return result
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
-        _emit_progress(project_id, "workflow", "failed", "Workflow execution failed", error_message=message)
-        return _public_result({"workflow_status": "FAILED", "error_message": message, "application_url": "", "revision_count": 0}, project_id)
+        _emit_progress(project_id, "workflow", "failed", "Workflow execution failed", run_id=resolved_run_id, error_message=message)
+        return _public_result(
+            {"workflow_status": "FAILED", "error_message": message, "application_url": "", "revision_count": 0},
+            project_id,
+            resolved_run_id,
+        )
     finally:
         _progress_callback.reset(token)
 
 
-async def run_workflow_async(project_id: str, user_request: str, on_progress=None) -> dict[str, Any]:
-    """Async-safe wrapper; runs the synchronous graph in a worker thread.
+def resume_workflow(
+    project_id: str,
+    run_id: str,
+    approved: bool,
+    feedback: str = "",
+    on_progress=None,
+) -> dict[str, Any]:
+    """Resume a checkpointed run after approval or a change request."""
+    config = {
+        "recursion_limit": 60,
+        "configurable": {"thread_id": str(run_id)},
+    }
+    token = _progress_callback.set(on_progress)
+    _emit_progress(project_id, "workflow", "resuming", "Resuming workflow after plan review.", run_id=str(run_id))
+    try:
+        final_state = app.invoke(
+            Command(resume={"approved": bool(approved), "feedback": feedback}),
+            config=config,
+        )
+        result = _result_after_invoke(final_state, project_id, str(run_id))
+        status = result["workflow_status"]
+        if status == "WAITING_FOR_APPROVAL":
+            _emit_progress(
+                project_id, "workflow", "waiting_for_approval",
+                "Updated plan is ready for review.",
+                run_id=str(run_id), planner_md=result.get("planner_md", ""),
+            )
+        else:
+            _emit_progress(
+                project_id, "workflow",
+                "completed" if status == "COMPLETED" else "failed",
+                f"Workflow {status.lower()}",
+                run_id=str(run_id), result_status=status,
+                application_url=result.get("application_url", ""),
+                error_message=result.get("error_message", ""),
+            )
+        return result
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        _emit_progress(project_id, "workflow", "failed", "Workflow resumption failed", run_id=str(run_id), error_message=message)
+        return _public_result(
+            {"workflow_status": "FAILED", "error_message": message, "application_url": "", "revision_count": 0},
+            project_id,
+            str(run_id),
+        )
+    finally:
+        _progress_callback.reset(token)
 
-    Awaiting this returns the final result but does not block the event loop.
-    For an HTTP endpoint that must return immediately, use submit_workflow_background.
-    """
+
+async def run_workflow_async(
+    project_id: str,
+    user_request: str,
+    on_progress=None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Async-safe initial run; returns when complete or awaiting approval."""
     loop = asyncio.get_running_loop()
     token = _progress_loop.set(loop)
     try:
-        return await asyncio.to_thread(run_workflow, project_id, user_request, on_progress)
+        return await asyncio.to_thread(
+            run_workflow, project_id, user_request, on_progress, run_id
+        )
+    finally:
+        _progress_loop.reset(token)
+
+
+async def resume_workflow_async(
+    project_id: str,
+    run_id: str,
+    approved: bool,
+    feedback: str = "",
+    on_progress=None,
+) -> dict[str, Any]:
+    """Async-safe resume for a previously interrupted run."""
+    loop = asyncio.get_running_loop()
+    token = _progress_loop.set(loop)
+    try:
+        return await asyncio.to_thread(
+            resume_workflow, project_id, run_id, approved, feedback, on_progress
+        )
     finally:
         _progress_loop.reset(token)
 
