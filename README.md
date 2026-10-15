@@ -267,7 +267,7 @@ This project is developed collaboratively, with each contributor responsible for
 ### Related Repositories
 
 - **Main Platform:** [multi-agent-platform] (https://github.com/teja-gandhari/multi-agent-platform)
-- **Frontend:** [nexuxai_frontend] (https://github.com/maheshguggilla2504-oss/nexuxai_frontend)
+- **Frontend:** [nexuxai_frontend] (https://github.com/maheshguggilla2504-oss/nexus-ai-orchestrator)
 
 We collaborate to integrate the backend, AI orchestration, and frontend into one multi-agent platform.
 
