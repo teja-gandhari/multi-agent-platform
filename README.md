@@ -253,22 +253,23 @@ Use the exact schemas shown in Swagger.
 -   [ ] Run `python -m pytest -q`.
 -   [ ] Test frontend integration separately once the UI is connected.
 
-## Team Contributions
 
-Update this section to match the team's actual contributions.
+## 👥 Contributors
 
--   **Backend and integration:** FastAPI APIs,
-    authentication/authorization, PostgreSQL models and migrations,
-    project/task services, Redis, WebSockets, run history, and workflow
-    adapter.
--   **AI and LangGraph:** Agent implementations, graph state and
-    routing, planning, and downstream workflow logic.
--   **Frontend:** UI, API integration, plan review/approval screens,
-    live progress, and run-history views.
+This project is developed collaboratively, with each contributor responsible for different components of the platform.
 
-For future work, use individual branches and pull requests. GitHub
-commit attribution is based on commit author metadata, so document
-contributions honestly.
+| GitHub Account | Responsibility | Contributions |
+|---|---|---|
+| [@teja-gandhari](https://github.com/teja-gandhari) | Backend & Integration | FastAPI, PostgreSQL, SQLAlchemy, Alembic, JWT authentication, project/task APIs, Redis Pub/Sub, WebSockets, run history, and backend–AI workflow integration. |
+| [@maheshguggilla2504-oss](https://github.com/maheshguggilla2504-oss) | AI & LangGraph | Multi-agent orchestration, LangGraph workflow, agent coordination, planning, and workflow execution. |
+| Frontend Contributor | Frontend Development | UI development, API integration, Planner approval screens, live agent progress, and run history interface. |
+
+### Related Repositories
+
+- **Main Platform:** [multi-agent-platform] (https://github.com/teja-gandhari/multi-agent-platform)
+- **Frontend:** [nexuxai_frontend] (https://github.com/maheshguggilla2504-oss/nexuxai_frontend)
+
+We collaborate to integrate the backend, AI orchestration, and frontend into one multi-agent platform.
 
 ## Security
 
@@ -297,19 +298,3 @@ contributions honestly.
 3.  Run relevant tests locally.
 4.  Open a pull request against `main` with a clear description.
 
-## License
-
-No license is specified here. Add a `LICENSE` file before distributing
-the project as open source. Without a license, normal copyright
-restrictions apply.
-
-------------------------------------------------------------------------
-
-```{=html}
-<p align="center">
-```
-`<strong>`{=html}NexusAI --- Plan collaboratively. Approve deliberately.
-Execute transparently.`</strong>`{=html}
-```{=html}
-</p>
-```
