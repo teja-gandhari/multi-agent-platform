@@ -15,8 +15,10 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 GENERATED_DIR = BASE_DIR / "generated_projects"
 
-HOST = "127.0.0.1"
+BIND_HOST = "0.0.0.0"
+PUBLIC_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
+
 STATE_FILE_NAME = ".nexus_running.json"
 
 _CHILDREN: dict[int, subprocess.Popen] = {}
@@ -51,7 +53,7 @@ def port_is_available(host: str, port: int) -> bool:
 
 def _find_port(start: int = DEFAULT_PORT, attempts: int = 50) -> int:
     for port in range(start, start + attempts):
-        if port_is_available(HOST, port):
+        if port_is_available(BIND_HOST, port):
             return port
 
     raise RuntimeError(
@@ -230,7 +232,7 @@ def runner(
                 "errors": f"Invalid frontend port: {frontend_port}",
             }
 
-        if not port_is_available(HOST, frontend_port):
+        if not port_is_available(BIND_HOST, frontend_port):
             return {
                 "status": "FAILED",
                 "project_id": project_id,
@@ -265,7 +267,7 @@ def runner(
                     "http.server",
                     str(port),
                     "--bind",
-                    HOST,
+                    BIND_HOST,
                 ],
                 cwd=str(project_dir),
                 stdout=log,
@@ -285,7 +287,7 @@ def runner(
     _CHILDREN[process.pid] = process
 
     # No trailing slash, for consistent API responses.
-    url = f"http://{HOST}:{port}"
+    url = f"http://{PUBLIC_HOST}:{port}"
     deadline = time.monotonic() + 8
     last_error = "Server did not respond."
 

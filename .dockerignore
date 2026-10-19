@@ -1,0 +1,24 @@
+
+# Python environments and generated files
+**/venv/
+**/.venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+
+# Secrets and local environment configuration
+**/.env
+**/.env.*
+!**/.env.example
+
+# Git and editor files
+.git/
+.vscode/
+
+# Local test artifacts
+**/.coverage
+**/htmlcov/
+
+# Node dependencies, if the frontend is later added
+**/node_modules/
